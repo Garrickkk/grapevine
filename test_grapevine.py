@@ -1,5 +1,7 @@
 """Tests for grapevine v0.1. Run with:  python -m unittest -v"""
 
+import contextlib
+import io
 import socket
 import threading
 import unittest
@@ -81,11 +83,22 @@ class TestScanPort(unittest.TestCase):
 
 
 class TestCLI(unittest.TestCase):
+    def run_cli(self, args):
+        """Run the CLI, capturing its error output so it doesn't clutter test results."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = grapevine.main(args)
+        return code, err.getvalue()
+
     def test_bad_port_exit_code(self):
-        self.assertEqual(grapevine.main(["127.0.0.1", "-p", "99999"]), 2)
+        code, err = self.run_cli(["127.0.0.1", "-p", "99999"])
+        self.assertEqual(code, 2)
+        self.assertIn("out of range", err)
 
     def test_bad_host_exit_code(self):
-        self.assertEqual(grapevine.main(["no-such-host.invalid", "-p", "80"]), 2)
+        code, err = self.run_cli(["no-such-host.invalid", "-p", "80"])
+        self.assertEqual(code, 2)
+        self.assertIn("could not resolve", err)
 
 
 if __name__ == "__main__":
