@@ -90,13 +90,16 @@ A connect scan needs no special privileges, but every completed connection can s
 
 An open port only proves *something* is listening. Service detection (in `services.py`) talks to each open port to find out *what*:
 
-1. **Listen for a greeting.** Many protocols announce themselves the moment you connect: SSH sends `SSH-2.0-OpenSSH_9.6p1`, FTP and SMTP send a `220` line, MySQL sends a binary handshake packet containing its version.
-2. **Probe if it stays silent.** Web servers wait for the client to speak first, so grapevine sends a minimal `HEAD / HTTP/1.0` request and reads the `Server` header. On common web ports it skips waiting and probes immediately.
-3. **TLS first on encrypted ports.** On ports like 443 and 993 it performs a TLS handshake, records the TLS version, then identifies the service inside the encrypted channel. Certificates aren't verified, because the goal is to identify the service, not to trust it. When scanning by hostname, it sends SNI so servers hosting several sites return the right one.
-4. **Match patterns.** The response is matched against known formats to extract the product and version, e.g. `Server: nginx/1.24.0 (Ubuntu)` → nginx 1.24.0.
-5. **Fall back to a guess.** If nothing useful comes back, the service is guessed from the port number and marked with `?`, so guesses are never presented as facts.
+1. **Listen for a greeting.** Many protocols announce themselves the moment you connect: SSH sends `SSH-2.0-OpenSSH_9.6p1`, FTP and SMTP send a `220` line, MySQL sends a binary handshake packet containing its version. Leading blank lines, and the text some SSH servers send before their version line, are skipped.
+2. **Probe if it stays silent.** Web servers wait for the client to speak first, so grapevine sends a minimal `GET / HTTP/1.0` request and reads the `Server` header. (`GET` rather than `HEAD`, because some embedded web servers ignore `HEAD`.) On common web ports it skips waiting and probes immediately.
+3. **TLS first on encrypted ports.** On ports like 443 and 993 it performs a TLS handshake, records the TLS version, then identifies the service inside the encrypted channel. If the handshake fails, it falls back to plain TCP, which catches plain HTTP on port 443.
+4. **TLS retry everywhere else.** When a TLS server receives plain text, it hangs up without a word. So if any service closes the connection without sending anything, grapevine retries over TLS. This finds HTTPS on non-standard ports like 4443 or 9443, which admin panels often use. A service that merely stays silent (times out) isn't retried, because silence alone doesn't suggest TLS.
+5. **Match patterns.** The response is matched against known formats to extract the product and version, e.g. `Server: nginx/1.24.0 (Ubuntu)` → nginx 1.24.0.
+6. **Fall back to a guess.** If nothing useful comes back, the service is guessed from the port number and marked with `?`, so guesses are never presented as facts.
 
-Some detections come from clever side effects. Redis doesn't understand HTTP, but its reply to the HTTP probe (`-ERR unknown command 'HEAD'`) is distinctive enough to identify it. MariaDB reports itself with a MySQL-compatible version string (`5.5.5-10.11.6-MariaDB`), which grapevine decodes to the real version.
+About TLS: certificates aren't verified, because the goal is to identify the service, not to trust it. When scanning by hostname, grapevine sends SNI so servers hosting several sites return the right one. It also accepts outdated protocol versions (TLS 1.0 and 1.1) that Python refuses by default, because old routers and IoT devices still use them, and seeing `TLSv1` in the results is itself a security finding: those versions have known weaknesses and were officially deprecated in 2021 (RFC 8996).
+
+Some detections come from clever side effects. Redis doesn't speak HTTP, but `GET` happens to be a Redis command too, so Redis answers the HTTP probe with a distinctive error (`-ERR wrong number of arguments for 'get' command`). MariaDB reports itself with a MySQL-compatible version string (`5.5.5-10.11.6-MariaDB`), which grapevine decodes to the real version.
 
 All banner text is reduced to plain printable ASCII before printing, so a malicious or broken service can't inject terminal control codes into your output.
 
@@ -133,6 +136,8 @@ Here threads are **slower**: when replies are instant there is no waiting to ove
 
 - **Results can lie, and banners help catch it.** In v0.1, port 80 on an unreachable address showed as *open*. Running v0.2 against it revealed the banner `HTTP/1.1 426 Upgrade Required`: a transparent proxy on the network was completing the handshake on the address's behalf. A connect scan only proves *something* answered; service detection shows *what* answered.
 - **Timeouts are a trade-off.** Too short, and slow-responding open ports are misreported as filtered, or a slow service's banner is missed. Too long, and scanning takes forever.
+- **Test against messy services, not just well-behaved ones.** grapevine's first test lab only had tidy fake services, and everything passed. A second lab of awkward ones (HTTPS on port 9443, an old TLS 1.0 server, SSH with a login notice before its version line, a banner starting with a blank line) exposed four detection gaps, all fixed before release.
+- **Packet loss can hide open ports.** On a real network, a single dropped packet makes an open port look *filtered*. Nmap retransmits probes to compensate; grapevine doesn't yet, so a port that should be open can occasionally be missed. Re-running the scan or raising `-t` helps.
 - **Not every protocol speaks first.** Some services greet you immediately, others wait for a request, and some never respond to anything you don't speak their protocol for. A scanner has to handle all three.
 - **Operating systems behave differently.** When a closed port refuses a connection, Linux and macOS report it instantly, but Windows retries for about 2 seconds first. With a short timeout, closed ports on Windows can show up as *filtered*. Open ports aren't affected. On Windows, use `-t 3` when you need an accurate closed/filtered split.
 - **More threads isn't always better.** Very high thread counts can hit the OS limit on open file descriptors and can look like a flood to the target network.
@@ -153,7 +158,7 @@ grapevine/
 python -m unittest -v
 ```
 
-The scanning tests open a real listening socket on localhost for the "open" case, use an unused port for "closed", and simulate a timeout for "filtered". The service detection tests check each parser against realistic banners (OpenSSH, nginx, vsFTPd, Postfix, MySQL, MariaDB, Redis…) and run live detection against fake services on localhost. No network access is needed.
+The scanning tests open a real listening socket on localhost for the "open" case, use an unused port for "closed", and simulate a timeout for "filtered". The service detection tests check each parser against realistic banners (OpenSSH, nginx, vsFTPd, Postfix, MySQL, MariaDB, Redis…) and run live detection against fake services on localhost, including real TLS services using a throwaway test certificate embedded in `test_services.py`. No network access or extra software is needed.
 
 ## Disclaimer
 

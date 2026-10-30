@@ -12,11 +12,14 @@ the service to find out *what* it is:
 4. If nothing useful comes back, fall back to guessing from the port number,
    and mark the result as unconfirmed.
 
-Ports that usually use TLS (443, 993, ...) get a TLS handshake first.
+Ports that usually use TLS (443, 993, ...) get a TLS handshake first. On
+other ports, a service that hangs up without saying anything is retried
+over TLS, which catches HTTPS on non-standard ports like 4443 or 9443.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import socket
 import ssl
@@ -42,7 +45,8 @@ TLS_PORTS = frozenset({443, 465, 636, 853, 993, 995, 8443})
 CLIENT_SPEAKS_FIRST = frozenset({80, 81, 443, 591, 3000, 5000, 8000, 8008,
                                  8080, 8081, 8443, 8888, 9000})
 
-HTTP_PROBE = "HEAD / HTTP/1.0\r\nHost: {host}\r\nUser-Agent: grapevine\r\n\r\n"
+# GET rather than HEAD: some embedded web servers ignore HEAD requests.
+HTTP_PROBE = "GET / HTTP/1.0\r\nHost: {host}\r\nUser-Agent: grapevine\r\n\r\n"
 
 MAX_READ = 4096
 
@@ -81,36 +85,64 @@ class ServiceInfo:
 def detect(ip: str, port: int, timeout: float = 2.0, hostname: str | None = None) -> ServiceInfo:
     """Find out what service is running on an open port."""
     host = hostname or ip
+    tried_tls = False
 
     if port in TLS_PORTS:
         info = _detect_tls(ip, port, timeout, host)
         if info is not None:
             return info
-        # Handshake failed: the port isn't speaking TLS, try plain TCP.
+        tried_tls = True  # handshake failed: the port isn't speaking TLS
 
+    data, hung_up = b"", False
     try:
         with socket.create_connection((ip, port), timeout=timeout) as sock:
-            data = _converse(sock, port, host)
+            data, hung_up = _converse(sock, port, host)
     except OSError:
-        data = b""
+        pass
 
-    return identify(data, port) or guess_from_port(port)
+    info = identify(data, port)
+    if info is not None:
+        return info
+
+    # The service closed the connection without a word. TLS servers do this
+    # when they receive plain text, so it may be TLS on an unusual port.
+    if hung_up and not tried_tls:
+        # It already showed it waits for us to speak, so probe straight away.
+        info = _detect_tls(ip, port, timeout, host, probe_first=True)
+        if info is not None:
+            return info
+
+    return guess_from_port(port)
 
 
-def _detect_tls(ip: str, port: int, timeout: float, host: str) -> ServiceInfo | None:
-    """Do a TLS handshake, then identify the service inside the encrypted channel."""
+def _tls_context() -> ssl.SSLContext:
+    """A TLS context suitable for scanning rather than for secure browsing."""
     context = ssl.create_default_context()
     # We're identifying the service, not trusting it, so don't reject
     # self-signed or mismatched certificates.
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
+    # Python refuses old protocol versions (TLS 1.0/1.1) by default, but old
+    # routers and IoT devices still use them, and finding one is useful.
+    # Lower the bar so we can talk to them; not every OpenSSL build allows it.
+    try:
+        context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        context.set_ciphers("ALL:@SECLEVEL=0")
+    except (ValueError, ssl.SSLError):
+        pass
+    return context
+
+
+def _detect_tls(ip: str, port: int, timeout: float, host: str,
+                probe_first: bool = False) -> ServiceInfo | None:
+    """Do a TLS handshake, then identify the service inside the encrypted channel."""
     try:
         with socket.create_connection((ip, port), timeout=timeout) as raw:
             # server_hostname enables SNI, so virtual hosts return the right site.
             sni = None if _is_ip(host) else host
-            with context.wrap_socket(raw, server_hostname=sni) as tls_sock:
+            with _tls_context().wrap_socket(raw, server_hostname=sni) as tls_sock:
                 tls_version = tls_sock.version() or "TLS"
-                data = _converse(tls_sock, port, host)
+                data, _ = _converse(tls_sock, port, host, probe_first)
     except OSError:  # includes ssl.SSLError
         return None
 
@@ -122,26 +154,38 @@ def _detect_tls(ip: str, port: int, timeout: float, host: str) -> ServiceInfo | 
     return info
 
 
-def _converse(sock: socket.socket, port: int, host: str) -> bytes:
-    """Read the service's greeting, or send an HTTP probe if it stays quiet."""
-    data = b"" if port in CLIENT_SPEAKS_FIRST else _read(sock)
-    if not data:
-        try:
-            sock.sendall(HTTP_PROBE.format(host=host).encode())
-        except OSError:
-            return b""
-        data = _read(sock)
-    return data
+def _converse(sock: socket.socket, port: int, host: str,
+              probe_first: bool = False) -> tuple[bytes, bool]:
+    """Read the service's greeting, or send an HTTP probe if it stays quiet.
+
+    Returns (data, hung_up). hung_up is True if the service closed the
+    connection without sending anything, as opposed to just staying silent.
+    """
+    if not probe_first and port not in CLIENT_SPEAKS_FIRST:
+        data, hung_up = _read(sock)
+        if data or hung_up:
+            return data, hung_up
+    try:
+        sock.sendall(HTTP_PROBE.format(host=host).encode())
+    except OSError:
+        return b"", True
+    return _read(sock)
 
 
-def _read(sock: socket.socket) -> bytes:
-    """Read what the service sends, up to MAX_READ bytes."""
+def _read(sock: socket.socket) -> tuple[bytes, bool]:
+    """Read what the service sends, up to MAX_READ bytes.
+
+    Returns (data, hung_up): hung_up is True if the connection was closed or
+    reset before any data arrived, False if we simply timed out waiting.
+    """
     try:
         data = sock.recv(MAX_READ)
-    except OSError:  # includes timeouts
-        return b""
+    except socket.timeout:
+        return b"", False
+    except OSError:  # connection reset, etc.
+        return b"", True
     if not data:
-        return b""
+        return b"", True
     # Responses can arrive in several pieces; collect anything that follows
     # closely behind the first piece.
     chunks = [data]
@@ -156,14 +200,14 @@ def _read(sock: socket.socket) -> bytes:
             total += len(more)
     except OSError:
         pass
-    return b"".join(chunks)
+    return b"".join(chunks), False
 
 
 def _is_ip(text: str) -> bool:
     try:
-        socket.inet_aton(text)
+        ipaddress.ip_address(text)
         return True
-    except OSError:
+    except ValueError:
         return False
 
 
@@ -186,11 +230,16 @@ def identify(data: bytes, port: int) -> ServiceInfo | None:
     if mysql:
         return mysql
 
-    text = data.decode("utf-8", errors="replace")
-    first_line = clean(text.splitlines()[0]) if text.strip() else ""
+    # Ignore leading blank lines; some services send one before their banner.
+    text = data.decode("utf-8", errors="replace").lstrip()
+    lines = [line for line in text.splitlines() if line.strip()]
+    first_line = clean(lines[0]) if lines else ""
 
-    if text.startswith("SSH-"):
-        return parse_ssh(first_line)
+    # SSH servers may send text lines (e.g. a legal notice) before the
+    # "SSH-2.0-..." line, so look for it anywhere in the greeting.
+    ssh_line = next((line for line in lines if line.startswith("SSH-")), None)
+    if ssh_line:
+        return parse_ssh(clean(ssh_line))
     if text.startswith("HTTP/"):
         return parse_http(text)
     if text.startswith(("+PONG", "-NOAUTH", "-DENIED")) or (

@@ -3,7 +3,6 @@
 import contextlib
 import io
 import socket
-import threading
 import unittest
 from unittest import mock
 

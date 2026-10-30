@@ -1,11 +1,40 @@
 """Tests for grapevine's service detection. Run with:  python -m unittest -v"""
 
+import os
 import socket
+import ssl
+import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 import grapevine
 import services
+
+
+# Self-signed certificate and key used ONLY by these tests, to run fake TLS
+# services on localhost. They protect nothing; don't reuse them anywhere.
+TEST_CERT = """\
+-----BEGIN CERTIFICATE-----
+MIIBiTCCAS+gAwIBAgIUVFSoxlWB7CQoxi7efnA4VHKcXWcwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOZ3JhcGV2aW5lLXRlc3QwIBcNMjYxMDI5MTc0MzU5WhgPMjEy
+NjEwMDUxNzQzNTlaMBkxFzAVBgNVBAMMDmdyYXBldmluZS10ZXN0MFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAElRLfVVN3+gPq0buZocWLxFAZQyJdEOjTA9rYcxxP
+YgD0YQn8ISTaVoIxe7I+px54fG9OKRas5vIFPvJ4DRik9aNTMFEwHQYDVR0OBBYE
+FHbLDdjhca974Nzh6O+Xew5x0i0oMB8GA1UdIwQYMBaAFHbLDdjhca974Nzh6O+X
+ew5x0i0oMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgacOhrROu
+MBchrJOmoH/bFfsTMtXDS4zc3t49PNXT8N4CIQCBghti/kiJA2szRcjRiLFQo6g+
+9DlA0FYmnTbyEUbh6A==
+-----END CERTIFICATE-----
+"""
+TEST_KEY = """\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7fEBgZbyWtOjVzNp
+h4YCBtzwHY1WcOGw5L+8qNe/0mehRANCAASVEt9VU3f6A+rRu5mhxYvEUBlDIl0Q
+6NMD2thzHE9iAPRhCfwhJNpWgjF7sj6nHnh8b04pFqzm8gU+8ngNGKT1
+-----END PRIVATE KEY-----
+"""
 
 
 def mysql_packet(payload: bytes) -> bytes:
@@ -65,6 +94,20 @@ class TestIdentify(unittest.TestCase):
         info = services.identify(b"-ERR unknown command 'HEAD', with args beginning with: \r\n", 6379)
         self.assertEqual(info.name, "redis")
 
+    def test_redis_reply_to_get_probe(self):
+        # GET is also a Redis command, so Redis complains about its arguments.
+        data = b"-ERR wrong number of arguments for 'get' command\r\n"
+        self.assertEqual(services.identify(data, 6379).name, "redis")
+
+    def test_ssh_with_lines_before_banner(self):
+        data = b"Authorized use only\r\nSSH-2.0-OpenSSH_8.9p1 Debian-3\r\n"
+        info = services.identify(data, 22)
+        self.assertEqual((info.name, info.product, info.version), ("ssh", "OpenSSH", "8.9p1"))
+
+    def test_banner_after_blank_line(self):
+        info = services.identify(b"\r\n220 (vsFTPd 3.0.3)\r\n", 21)
+        self.assertEqual((info.name, info.product, info.version), ("ftp", "vsFTPd", "3.0.3"))
+
     def test_redis_needing_password(self):
         self.assertEqual(services.identify(b"-NOAUTH Authentication required.\r\n", 6380).name, "redis")
 
@@ -111,10 +154,18 @@ class TestServiceInfo(unittest.TestCase):
 
 
 class FakeService:
-    """A tiny TCP server on localhost that behaves like a real service."""
+    """A tiny TCP server on localhost that behaves like a real service.
 
-    def __init__(self, greeting: bytes = b"", reply: bytes = b""):
-        self.greeting, self.reply = greeting, reply
+    greeting: sent as soon as a client connects
+    reply:    sent after the client sends something
+    tls:      wrap connections in TLS (using the test certificate)
+    hold:     with no greeting or reply, keep the connection open this many
+              seconds without answering, instead of hanging up
+    """
+
+    def __init__(self, greeting=b"", reply=b"", tls=False, hold=0.0):
+        self.greeting, self.reply, self.hold = greeting, reply, hold
+        self.context = _server_tls_context() if tls else None
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(5)
@@ -127,21 +178,44 @@ class FakeService:
                 conn, _ = self.sock.accept()
             except OSError:
                 return
-            with conn:
-                try:
-                    conn.settimeout(3)
-                    if self.greeting:
-                        conn.sendall(self.greeting)
-                    if self.reply:
-                        conn.recv(1024)
-                        conn.sendall(self.reply)
-                    else:
-                        conn.recv(1024)
-                except OSError:
-                    pass
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            conn.settimeout(3)
+            if self.context:
+                conn = self.context.wrap_socket(conn, server_side=True)
+            if self.greeting:
+                conn.sendall(self.greeting)
+            if self.reply:
+                conn.recv(1024)
+                conn.sendall(self.reply)
+            elif self.hold:
+                time.sleep(self.hold)
+            else:
+                conn.recv(1024)
+        except OSError:
+            pass  # includes failed TLS handshakes from plain-text clients
+        finally:
+            conn.close()
 
     def close(self):
         self.sock.close()
+
+
+def _server_tls_context() -> ssl.SSLContext:
+    with tempfile.TemporaryDirectory() as tmp:
+        cert, key = os.path.join(tmp, "cert.pem"), os.path.join(tmp, "key.pem")
+        with open(cert, "w") as f:
+            f.write(TEST_CERT)
+        with open(key, "w") as f:
+            f.write(TEST_KEY)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+    return context
+
+
+HTTP_OK = b"HTTP/1.0 200 OK\r\nServer: TestServer/2.1\r\n\r\n"
 
 
 class TestDetectLive(unittest.TestCase):
@@ -181,6 +255,45 @@ class TestDetectLive(unittest.TestCase):
             ftp.close()
         self.assertEqual(infos[ssh.port].name, "ssh")
         self.assertEqual(infos[ftp.port].name, "ftp")
+
+
+    def test_https_on_unusual_port(self):
+        # Plain text gets no answer, so grapevine retries with TLS.
+        svc = FakeService(reply=HTTP_OK, tls=True)
+        try:
+            info = services.detect("127.0.0.1", svc.port, timeout=0.5)
+        finally:
+            svc.close()
+        self.assertEqual((info.label, info.product), ("ssl/http", "TestServer"))
+        self.assertIn("TLS", info.extra)
+
+    def test_tls_port_tries_tls_first(self):
+        svc = FakeService(reply=HTTP_OK, tls=True)
+        with mock.patch.object(services, "TLS_PORTS", frozenset({svc.port})):
+            try:
+                info = services.detect("127.0.0.1", svc.port, timeout=0.5)
+            finally:
+                svc.close()
+        self.assertEqual(info.label, "ssl/http")
+
+    def test_plain_service_on_tls_port_falls_back(self):
+        svc = FakeService(reply=HTTP_OK)
+        with mock.patch.object(services, "TLS_PORTS", frozenset({svc.port})):
+            try:
+                info = services.detect("127.0.0.1", svc.port, timeout=0.5)
+            finally:
+                svc.close()
+        self.assertEqual((info.label, info.product), ("http", "TestServer"))
+
+    def test_no_tls_retry_when_service_just_stays_silent(self):
+        # Silence (timeout) is not a hang-up, so there's no reason to try TLS.
+        svc = FakeService(hold=2.0)
+        with mock.patch.object(services, "_detect_tls") as tls:
+            try:
+                services.detect("127.0.0.1", svc.port, timeout=0.3)
+            finally:
+                svc.close()
+        tls.assert_not_called()
 
 
 if __name__ == "__main__":
