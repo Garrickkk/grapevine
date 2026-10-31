@@ -249,12 +249,12 @@ class TestDetectLive(unittest.TestCase):
         ssh = FakeService(greeting=b"SSH-2.0-OpenSSH_9.6p1\r\n")
         ftp = FakeService(greeting=b"220 (vsFTPd 3.0.5)\r\n")
         try:
-            infos = grapevine.detect_services("127.0.0.1", [ssh.port, ftp.port], 2.0, workers=10)
+            infos = grapevine.detect_services([("127.0.0.1", ssh.port), ("127.0.0.1", ftp.port)], 2.0, workers=10)
         finally:
             ssh.close()
             ftp.close()
-        self.assertEqual(infos[ssh.port].name, "ssh")
-        self.assertEqual(infos[ftp.port].name, "ftp")
+        self.assertEqual(infos[("127.0.0.1", ssh.port)].name, "ssh")
+        self.assertEqual(infos[("127.0.0.1", ftp.port)].name, "ftp")
 
 
     def test_https_on_unusual_port(self):

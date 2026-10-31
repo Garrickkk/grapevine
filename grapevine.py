@@ -1,130 +1,57 @@
 #!/usr/bin/env python3
-"""grapevine v0.2: a TCP port scanner with service detection.
+"""grapevine v0.3: a TCP port and network scanner.
 
-Scans one host, reports each port as open, closed or filtered, then talks
-to every open port to identify the service and version running on it.
-Supports a sequential mode and a threaded (concurrent) mode so the
-speed difference can be measured.
+Takes single hosts or whole networks, finds which hosts are up, scans their
+ports (open, closed or filtered), then talks to every open port to identify
+the service and version running on it.
 
-Only scan hosts you own or have explicit permission to test.
+Only scan hosts and networks you own or have explicit permission to test.
 """
 
 from __future__ import annotations
 
 import argparse
 import errno
-import socket
+import ipaddress
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import services
+from discovery import (DISCOVERY_PORTS, HostStatus, discover, is_randomized,
+                       looks_intercepted, reverse_dns)
+from scanner import CLOSED, FILTERED, OPEN, run_parallel, scan_ports
+from targets import parse_ports, parse_targets
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-OPEN = "open"
-CLOSED = "closed"
-FILTERED = "filtered"
+Task = tuple[str, int]  # (ip, port)
 
 
-def scan_port(ip: str, port: int, timeout: float = 1.0) -> str:
-    """Try a TCP connect to ip:port and return the port's state.
+def detect_services(tasks: list[Task], timeout: float, workers: int,
+                    names: dict[str, str] | None = None) -> dict[Task, services.ServiceInfo]:
+    """Identify the service on each open (ip, port), several at a time.
 
-    connect_ex() returns an error code instead of raising an exception,
-    which makes it easy to tell *why* a connection failed:
-
-    - 0             -> handshake completed, something is listening  -> open
-    - ECONNREFUSED  -> host answered with RST, nothing listening    -> closed
-    - timeout       -> no answer at all, likely dropped by firewall -> filtered
+    names maps IPs to the hostname the user typed. It's passed along so TLS
+    and HTTP requests reach the right site on servers hosting several sites.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        try:
-            code = sock.connect_ex((ip, port))
-        except socket.timeout:
-            return FILTERED
-        except OSError:
-            return FILTERED
-
-    if code == 0:
-        return OPEN
-    if code == errno.ECONNREFUSED or code == getattr(errno, "WSAECONNREFUSED", -1):
-        return CLOSED
-    # EAGAIN/EWOULDBLOCK/ETIMEDOUT etc. all mean we got no reply in time.
-    return FILTERED
-
-
-def scan_sequential(ip: str, ports: list[int], timeout: float) -> dict[int, str]:
-    """Scan ports one after another."""
-    return {port: scan_port(ip, port, timeout) for port in ports}
-
-
-def scan_concurrent(ip: str, ports: list[int], timeout: float, workers: int) -> dict[int, str]:
-    """Scan ports using a thread pool.
-
-    Threads help even with Python's GIL because the program spends almost
-    all its time *waiting* on the network, and the GIL is released while
-    a thread waits on I/O.
-    """
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        states = pool.map(lambda p: scan_port(ip, p, timeout), ports)
-        return dict(zip(ports, states))
-
-
-def detect_services(ip: str, ports: list[int], timeout: float, workers: int,
-                    hostname: str | None = None) -> dict[int, services.ServiceInfo]:
-    """Identify the service on each open port, several ports at a time."""
-    if not ports:
-        return {}
-    with ThreadPoolExecutor(max_workers=min(workers, len(ports))) as pool:
-        infos = pool.map(lambda p: services.detect(ip, p, timeout, hostname), ports)
-        return dict(zip(ports, infos))
-
-
-def parse_ports(spec: str) -> list[int]:
-    """Parse "80", "1-1024", "22,80,443" or a mix like "22,80-90"."""
-    ports: set[int] = set()
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            if "-" in part:
-                start_s, end_s = part.split("-", 1)
-                start, end = int(start_s), int(end_s)
-                if start > end:
-                    raise ValueError(f"invalid range '{part}' (start is bigger than end)")
-                ports.update(range(start, end + 1))
-            else:
-                ports.add(int(part))
-        except ValueError as exc:
-            if "invalid range" in str(exc):
-                raise
-            raise ValueError(f"invalid port '{part}'") from None
-    if not ports:
-        raise ValueError("no ports given")
-    for port in ports:
-        if not 1 <= port <= 65535:
-            raise ValueError(f"port {port} is out of range (1-65535)")
-    return sorted(ports)
-
-
-def resolve(target: str) -> str:
-    """Turn a hostname or IP into an IPv4 address."""
-    try:
-        return socket.gethostbyname(target)
-    except socket.gaierror:
-        raise ValueError(f"could not resolve host '{target}'") from None
+    names = names or {}
+    infos = run_parallel(
+        lambda task: services.detect(task[0], task[1], timeout, names.get(task[0])),
+        tasks, workers,
+    )
+    return dict(zip(tasks, infos))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="grapevine: hear what every port has to say. "
-                    "TCP port scanner with service detection (v0.2).",
-        epilog="Only scan hosts you own or have permission to test. "
+                    "TCP port and network scanner with service detection (v0.3).",
+        epilog="Only scan hosts and networks you own or have permission to test. "
                "scanme.nmap.org is allowed for practice.",
     )
-    parser.add_argument("target", help="IP address or hostname to scan")
+    parser.add_argument("targets", nargs="+", metavar="TARGET",
+                        help="IP, hostname, network (192.168.1.0/24) or range "
+                             "(192.168.1.10-50); several allowed")
     parser.add_argument("-p", "--ports", default="1-1024",
                         help='ports to scan: "80", "1-1024", "22,80,443" (default: 1-1024)')
     parser.add_argument("-t", "--timeout", type=float, default=1.0,
@@ -141,6 +68,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="skip service detection (faster, ports only)")
     parser.add_argument("--detect-timeout", type=float, default=2.0,
                         help="seconds to wait for a service to answer (default: 2.0)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("-sn", "--discover-only", action="store_true",
+                      help="only find which hosts are up, don't scan their ports")
+    mode.add_argument("-Pn", "--skip-discovery", action="store_true",
+                      help="treat every host as up (for hosts that ignore discovery probes)")
+    parser.add_argument("-n", "--no-dns", action="store_true",
+                        help="don't look up hostnames of live hosts")
     parser.add_argument("--version", action="version", version=f"grapevine {__version__}")
     return parser
 
@@ -148,75 +82,177 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    try:
-        ports = parse_ports(args.ports)
-        ip = resolve(args.target)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
     if args.timeout <= 0 or args.detect_timeout <= 0 or args.workers < 1:
         print("error: timeouts must be > 0 and workers must be >= 1", file=sys.stderr)
         return 2
+    try:
+        ports = [] if args.discover_only else parse_ports(args.ports)
+        targets = parse_targets(args.targets)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
-    mode = "sequential" if args.sequential else f"concurrent, {args.workers} threads"
-    shown_target = args.target if args.target == ip else f"{args.target} ({ip})"
-    print(f"Scanning {shown_target}: {len(ports)} port(s), {mode}\n")
+    ips = [t.ip for t in targets]
+    typed_names = {t.ip: t.name for t in targets if t.name}
+    print_header(args, targets, ports)
 
     start = time.perf_counter()
+    results: dict[Task, str] = {}
+    infos: dict[Task, services.ServiceInfo] = {}
     try:
-        if args.sequential:
-            results = scan_sequential(ip, ports, args.timeout)
+        # 1. Host discovery
+        phase = time.perf_counter()
+        if args.skip_discovery:
+            status = {ip: HostStatus(up=True, reason="assumed (-Pn)") for ip in ips}
+            print(f"Host discovery skipped (-Pn): treating all {len(ips)} host(s) as up")
         else:
-            results = scan_concurrent(ip, ports, args.timeout, args.workers)
-        scan_time = time.perf_counter() - start
+            progress("Discovering hosts...")
+            status = discover(ips, args.timeout, args.workers)
+            live_count = sum(host.up for host in status.values())
+            print(f"{live_count} of {len(ips)} up ({time.perf_counter() - phase:.2f}s)")
+            shared = looks_intercepted(status)
+            if shared:
+                print(f"Warning: every host answered the same way ({shared}). On a real network\n"
+                      "that's unlikely: a proxy or firewall may be answering on their behalf.\n"
+                      "Use -b on a few hosts to see what is really responding.")
+        live = [ip for ip in ips if status[ip].up]
+        names = {} if args.no_dns else reverse_dns(live, args.workers)
+        names.update(typed_names)  # what the user typed beats reverse DNS
 
-        open_ports = [p for p, s in results.items() if s == OPEN]
-        infos: dict[int, services.ServiceInfo] = {}
-        if open_ports and not args.no_detect:
-            # Pass the hostname (not just the IP) so TLS and HTTP requests
-            # reach the right site on servers that host several websites.
-            hostname = None if args.target == ip else args.target
-            infos = detect_services(ip, open_ports, args.detect_timeout, args.workers, hostname)
+        # 2. Port scan
+        if live and ports:
+            phase = time.perf_counter()
+            progress("Scanning ports...")
+            tasks = [(ip, port) for ip in live for port in ports]
+            results = scan_ports(tasks, args.timeout, args.workers, args.sequential)
+            print(f"{len(live)} host(s) x {len(ports)} port(s) ({time.perf_counter() - phase:.2f}s)")
+
+        # 3. Service detection
+        open_tasks = [task for task, state in results.items() if state == OPEN]
+        if open_tasks and not args.no_detect:
+            phase = time.perf_counter()
+            progress("Detecting services...")
+            infos = detect_services(open_tasks, args.detect_timeout, args.workers, typed_names)
+            print(f"{len(open_tasks)} open port(s) ({time.perf_counter() - phase:.2f}s)")
     except KeyboardInterrupt:
         print("\nScan cancelled.")
         return 130
+    except OSError as exc:
+        if exc.errno not in (errno.EMFILE, errno.ENFILE):
+            raise
+        # Each thread holds an open socket, and the OS limits how many files
+        # a program may have open (only 256 by default on macOS).
+        print(f"\nerror: the system ran out of open files with {args.workers} threads. "
+              "Lower -w and try again.", file=sys.stderr)
+        return 1
     elapsed = time.perf_counter() - start
 
-    print_results(results, infos, args.all, args.banners)
-
-    counts = {OPEN: 0, CLOSED: 0, FILTERED: 0}
-    for state in results.values():
-        counts[state] += 1
-    timing = f"finished in {elapsed:.2f}s"
-    if infos:
-        timing += f" (port scan {scan_time:.2f}s, service detection {elapsed - scan_time:.2f}s)"
-    print(f"\n{counts[OPEN]} open, {counts[CLOSED]} closed, {counts[FILTERED]} filtered - {timing}")
+    print()
+    if not live:
+        print_nobody_home(len(ips))
+    elif args.discover_only:
+        print_live_hosts(live, status, names)
+    else:
+        print_port_report(live, status, names, results, infos, args.all, args.banners)
+    print_summary(len(ips), len(live), results, elapsed)
     return 0
 
 
-def print_results(results: dict[int, str], infos: dict[int, services.ServiceInfo],
-                  show_all: bool, show_banners: bool) -> None:
-    rows = [(p, s) for p, s in results.items() if show_all or s == OPEN]
-    if not rows:
-        print("No open ports found.")
-        return
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
 
-    detecting = bool(infos)
-    header = f"{'PORT':<10}{'STATE':<10}"
-    print((header + (f"{'SERVICE':<16}VERSION" if detecting else "")).rstrip())
-    any_guess = False
-    for port, state in rows:
-        line = f"{str(port) + '/tcp':<10}{state:<10}"
-        info = infos.get(port)
-        if info:
-            line += f"{info.label:<16}{info.details}"
-            any_guess = any_guess or info.label.endswith("?")
+def progress(label: str) -> None:
+    print(f"{label:<22}", end="", flush=True)
+
+
+def print_header(args: argparse.Namespace, targets: list, ports: list[int]) -> None:
+    if len(targets) == 1:
+        t = targets[0]
+        shown = f"{t.name} ({t.ip})" if t.name else t.ip
+    else:
+        shown = f"{' '.join(args.targets)} ({len(targets)} hosts)"
+    if args.discover_only:
+        print(f"Discovering hosts in {shown}\n")
+        return
+    mode = "sequential" if args.sequential else f"concurrent, {args.workers} threads"
+    print(f"Scanning {shown}: {len(ports)} port(s), {mode}\n")
+
+
+def sort_ips(ips: list[str]) -> list[str]:
+    return sorted(ips, key=ipaddress.IPv4Address)
+
+
+def host_title(ip: str, names: dict[str, str]) -> str:
+    return f"{ip} ({names[ip]})" if ip in names else ip
+
+
+def mac_text(mac: str) -> str:
+    return f"{mac} (random or virtual)" if mac and is_randomized(mac) else mac
+
+
+def print_nobody_home(count: int) -> None:
+    probes = ", ".join(str(p) for p in DISCOVERY_PORTS)
+    if count == 1:
+        print(f"Host seems down: no reply on tcp/{probes} and no ARP reply.")
+        print("If it's up but blocking these probes, try -Pn.")
+    else:
+        print("No hosts found up. If they're up but blocking discovery probes, try -Pn.")
+
+
+def print_live_hosts(live: list[str], status: dict[str, HostStatus], names: dict[str, str]) -> None:
+    print(f"{'HOST':<17}{'NAME':<26}{'REASON':<18}MAC")
+    for ip in sort_ips(live):
+        host = status[ip]
+        line = f"{ip:<17}{names.get(ip, ''):<26}{host.reason:<18}{mac_text(host.mac)}"
         print(line.rstrip())
-        if show_banners and info and info.banner:
-            print(f"{'':<10}|_ {info.banner}")
+
+
+def print_port_report(live: list[str], status: dict[str, HostStatus], names: dict[str, str],
+                      results: dict[Task, str], infos: dict[Task, services.ServiceInfo],
+                      show_all: bool, show_banners: bool) -> None:
+    detecting = bool(infos)
+    any_guess = False
+    for index, ip in enumerate(sort_ips(live)):
+        if index:
+            print()
+        host = status[ip]
+        print(host_title(ip, names))
+        details = f"Host is up: {host.reason}"
+        if host.mac:
+            details += f" | MAC {mac_text(host.mac)}"
+        print(f"  {details}")
+
+        rows = [(port, state) for (h, port), state in results.items()
+                if h == ip and (show_all or state == OPEN)]
+        if not rows:
+            states = [state for (h, _), state in results.items() if h == ip]
+            print(f"  No open ports ({states.count(CLOSED)} closed, {states.count(FILTERED)} filtered)")
+            continue
+
+        header = f"{'PORT':<10}{'STATE':<10}{'SERVICE':<16}VERSION" if detecting else f"{'PORT':<10}STATE"
+        print(f"  {header}")
+        for port, state in rows:
+            line = f"  {str(port) + '/tcp':<10}{state:<10}"
+            info = infos.get((ip, port))
+            if info:
+                line += f"{info.label:<16}{info.details}"
+                any_guess = any_guess or info.label.endswith("?")
+            print(line.rstrip())
+            if show_banners and info and info.banner:
+                print(f"  {'':<10}|_ {info.banner}")
 
     if any_guess:
         print("\n? = guessed from the port number; the service didn't say what it is")
+
+
+def print_summary(total: int, up: int, results: dict[Task, str], elapsed: float) -> None:
+    summary = f"{total} host(s) scanned, {up} up"
+    if results:
+        states = list(results.values())
+        summary += (f" | {states.count(OPEN)} open, {states.count(CLOSED)} closed, "
+                    f"{states.count(FILTERED)} filtered port(s)")
+    print(f"\n{summary} | finished in {elapsed:.2f}s")
 
 
 if __name__ == "__main__":

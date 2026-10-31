@@ -1,103 +1,113 @@
-"""Tests for grapevine v0.1. Run with:  python -m unittest -v"""
+"""End-to-end tests for the grapevine command line. Run with:  python -m unittest -v"""
 
 import contextlib
+import errno
 import io
 import socket
 import unittest
 from unittest import mock
 
 import grapevine
+from discovery import HostStatus
+
+# Generous timeout so localhost probes behave the same on Windows (see test_scanner.py).
+SLOW_OK = ["-t", "3"]
 
 
-def free_port() -> int:
-    """Find a port number with nothing listening on it."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def run_cli(args):
+    """Run grapevine with these arguments; return (exit code, output, errors)."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = grapevine.main(args)
+        except SystemExit as exc:  # argparse exits on invalid arguments
+            code = exc.code
+    return code, out.getvalue(), err.getvalue()
 
 
-class TestParsePorts(unittest.TestCase):
-    def test_single(self):
-        self.assertEqual(grapevine.parse_ports("80"), [80])
+class TestBadInput(unittest.TestCase):
+    def test_bad_port(self):
+        code, _, err = run_cli(["127.0.0.1", "-p", "99999"])
+        self.assertEqual(code, 2)
+        self.assertIn("out of range", err)
 
-    def test_range(self):
-        self.assertEqual(grapevine.parse_ports("20-23"), [20, 21, 22, 23])
+    def test_bad_host(self):
+        code, _, err = run_cli(["no-such-host.invalid", "-p", "80"])
+        self.assertEqual(code, 2)
+        self.assertIn("could not resolve", err)
 
-    def test_list_and_mix(self):
-        self.assertEqual(grapevine.parse_ports("443, 22,80-81"), [22, 80, 81, 443])
+    def test_network_too_big(self):
+        code, _, err = run_cli(["10.0.0.0/8"])
+        self.assertEqual(code, 2)
+        self.assertIn("limit", err)
 
-    def test_duplicates_removed(self):
-        self.assertEqual(grapevine.parse_ports("80,80,79-80"), [79, 80])
+    def test_zero_workers(self):
+        code, _, err = run_cli(["127.0.0.1", "-w", "0"])
+        self.assertEqual(code, 2)
 
-    def test_out_of_range(self):
-        with self.assertRaises(ValueError):
-            grapevine.parse_ports("70000")
-
-    def test_zero(self):
-        with self.assertRaises(ValueError):
-            grapevine.parse_ports("0")
-
-    def test_reversed_range(self):
-        with self.assertRaises(ValueError):
-            grapevine.parse_ports("100-10")
-
-    def test_not_a_number(self):
-        with self.assertRaises(ValueError):
-            grapevine.parse_ports("http")
+    def test_discover_only_and_skip_discovery_conflict(self):
+        code, _, err = run_cli(["127.0.0.1", "-sn", "-Pn"])
+        self.assertEqual(code, 2)
+        self.assertIn("not allowed with", err)
 
 
-# Windows retries refused connections for ~2 seconds before reporting them,
-# so closed-port checks need a generous timeout to work on every OS.
-CLOSED_TIMEOUT = 3.0
-
-
-class TestScanPort(unittest.TestCase):
+class TestScans(unittest.TestCase):
     def setUp(self):
-        # A real listening socket on localhost acts as an "open" service.
         self.server = socket.socket()
         self.server.bind(("127.0.0.1", 0))
         self.server.listen()
-        self.open_port = self.server.getsockname()[1]
+        self.port = str(self.server.getsockname()[1])
 
     def tearDown(self):
         self.server.close()
 
-    def test_open(self):
-        self.assertEqual(grapevine.scan_port("127.0.0.1", self.open_port), grapevine.OPEN)
+    def test_port_scan(self):
+        code, out, _ = run_cli(["127.0.0.1", "-p", self.port, "-n", "--no-detect", *SLOW_OK])
+        self.assertEqual(code, 0)
+        self.assertRegex(out, rf"{self.port}/tcp\s+open")
+        self.assertIn("1 host(s) scanned, 1 up", out)
 
-    def test_closed(self):
-        self.assertEqual(grapevine.scan_port("127.0.0.1", free_port(), CLOSED_TIMEOUT), grapevine.CLOSED)
+    def test_discover_only(self):
+        code, out, _ = run_cli(["127.0.0.1", "-sn", "-n", *SLOW_OK])
+        self.assertEqual(code, 0)
+        self.assertIn("HOST", out)
+        self.assertRegex(out, r"127\.0\.0\.1\s+tcp/\d+ (open|refused)")
+        self.assertNotIn("Scanning ports", out)
 
-    def test_filtered_on_timeout(self):
-        # Simulate a firewall silently dropping packets.
-        with mock.patch("socket.socket.connect_ex", side_effect=socket.timeout):
-            self.assertEqual(grapevine.scan_port("127.0.0.1", 9999), grapevine.FILTERED)
+    def test_skip_discovery(self):
+        with mock.patch.object(grapevine, "discover") as discover:
+            code, out, _ = run_cli(["127.0.0.1", "-Pn", "-p", self.port, "-n", "--no-detect"])
+        discover.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertIn("assumed (-Pn)", out)
+        self.assertRegex(out, rf"{self.port}/tcp\s+open")
 
-    def test_sequential_and_concurrent_agree(self):
-        ports = [self.open_port, free_port(), free_port()]
-        seq = grapevine.scan_sequential("127.0.0.1", ports, CLOSED_TIMEOUT)
-        con = grapevine.scan_concurrent("127.0.0.1", ports, CLOSED_TIMEOUT, workers=10)
-        self.assertEqual(seq, con)
-        self.assertEqual(con[self.open_port], grapevine.OPEN)
+    def test_host_down(self):
+        down = {"10.9.9.9": HostStatus()}
+        with mock.patch.object(grapevine, "discover", return_value=down):
+            code, out, _ = run_cli(["10.9.9.9", "-n"])
+        self.assertEqual(code, 0)
+        self.assertIn("Host seems down", out)
+        self.assertIn("-Pn", out)
+        self.assertNotIn("Scanning ports", out)
 
+    def test_several_hosts_reported_in_order(self):
+        up = {ip: HostStatus(True, "tcp/80 open") for ip in ("10.0.0.10", "10.0.0.9")}
+        states = {("10.0.0.9", 80): "open", ("10.0.0.10", 80): "closed"}
+        with mock.patch.object(grapevine, "discover", return_value=up), \
+             mock.patch.object(grapevine, "scan_ports", return_value=states):
+            code, out, _ = run_cli(["10.0.0.10,10.0.0.9", "-p", "80", "-n", "--no-detect"])
+        self.assertEqual(code, 0)
+        # Sorted numerically (10.0.0.9 before 10.0.0.10), not as text.
+        self.assertLess(out.index("10.0.0.9\n"), out.index("10.0.0.10\n"))
+        self.assertIn("No open ports (1 closed, 0 filtered)", out)
 
-class TestCLI(unittest.TestCase):
-    def run_cli(self, args):
-        """Run the CLI, capturing its error output so it doesn't clutter test results."""
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            code = grapevine.main(args)
-        return code, err.getvalue()
-
-    def test_bad_port_exit_code(self):
-        code, err = self.run_cli(["127.0.0.1", "-p", "99999"])
-        self.assertEqual(code, 2)
-        self.assertIn("out of range", err)
-
-    def test_bad_host_exit_code(self):
-        code, err = self.run_cli(["no-such-host.invalid", "-p", "80"])
-        self.assertEqual(code, 2)
-        self.assertIn("could not resolve", err)
+    def test_running_out_of_open_files(self):
+        error = OSError(errno.EMFILE, "Too many open files")
+        with mock.patch.object(grapevine, "discover", side_effect=error):
+            code, _, err = run_cli(["127.0.0.1", "-w", "500"])
+        self.assertEqual(code, 1)
+        self.assertIn("Lower -w", err)
 
 
 if __name__ == "__main__":
